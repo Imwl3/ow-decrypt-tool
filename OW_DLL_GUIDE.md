@@ -950,57 +950,217 @@ uint64_t CalcC(uint64_t encrypted, uint64_t decrypted, uint64_t base) {
 }
 ```
 
-### Complete Hook Implementation
+### ⚠️ WARNING: Inline Hooks Will Crash!
+
+**DO NOT use MinHook/Detours on this function!** The prologue uses RSP-relative addressing:
+
+```asm
+7ff642eb0b30  mov [rsp+10h], rbx    ; Uses CALLER's shadow space
+7ff642eb0b35  mov [rsp+18h], rbp    ; Uses CALLER's shadow space
+7ff642eb0b3a  mov [rsp+20h], rsi    ; Uses CALLER's shadow space
+```
+
+When a trampoline executes `mov [rsp+10h], rbx`, RSP has changed due to the CALL instruction,
+causing it to write to the wrong memory location → stack corruption → crash.
+
+### Solution: Hardware Breakpoint Hook (Recommended)
+
+Uses CPU debug registers like GDB - no code modification, no RSP issues.
 
 ```cpp
-#include <MinHook.h>  // or Detours
+#include <Windows.h>
+#include <TlHelp32.h>
 #include <cstdint>
+#include <cstdio>
 
+// Globals
 uint64_t g_C = 0;
 uint64_t g_Base = 0;
+uintptr_t g_HookAddr = 0;
+uintptr_t g_ReturnAddr = 0;
+uint64_t g_PendingEncrypted = 0;
+bool g_WaitingForReturn = false;
 
-// CORRECT signature:
-// - RCX = pointer to component array pointer (entity+0x80 is passed by caller)
-// - RDX = OUTPUT pointer where decrypted value is written
-// - R8  = index into component array
-// - Returns RDX (the output pointer)
-typedef void* (__fastcall* ReadCompFn)(uint64_t* comp_array_ptr, uint64_t* out_result, int index);
-ReadCompFn g_OrigReadComp = nullptr;
+inline uint64_t ror64(uint64_t v, int n) { return (v >> n) | (v << (64 - n)); }
+inline uint64_t rol64(uint64_t v, int n) { return (v << n) | (v >> (64 - n)); }
 
-void* __fastcall HookedReadComp(uint64_t* comp_array_ptr, uint64_t* out_result, int index) {
-    // RCX points to the component_array pointer - dereference to get array
-    // (caller passes entity+0x80, function does *RCX to get actual array)
-    uint64_t comp_arr = *comp_array_ptr;
-    uint64_t encrypted = *(uint64_t*)(comp_arr + index * 8);
+uint64_t CalcC(uint64_t encrypted, uint64_t decrypted, uint64_t base) {
+    uint64_t ctx_ptr = *(uint64_t*)(base + 0x3947AF8);
+    uint64_t ctx_xor = *(uint64_t*)(ctx_ptr + 0x17F);
+    uint64_t thunk_out = (decrypted ^ ctx_xor) - 0x246F476B55B569AAULL;
 
-    // Call original function - MUST pass out_result through!
-    // The function writes decrypted pointer to *out_result
-    void* result = g_OrigReadComp(comp_array_ptr, out_result, index);
+    uint64_t t = encrypted;
+    t = ror64(t, 3);
+    t = rol64(t, 23);
+    t += 0x77D1EEE9B57BB5D7ULL;
+    t ^= 0x92;
+    t = rol64(t, 28);
+    t += 0x5C2713451FEB52FAULL;
+    t ^= 0x1F4723AC9E4C34DDULL;
+    t ^= 0xD4AAE416F53FAE18ULL;
 
-    // After the call, *out_result contains the decrypted pointer
-    uint64_t decrypted = *out_result;
+    return t ^ thunk_out;
+}
 
-    // Calculate C from first valid pair
-    if (g_C == 0 && encrypted != 0 && decrypted != 0) {
-        g_C = CalcC(encrypted, decrypted, g_Base);
+LONG WINAPI HwbpHandler(EXCEPTION_POINTERS* ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP)
+        return EXCEPTION_CONTINUE_SEARCH;
 
-        char buf[128];
-        sprintf(buf, "[+] Captured C = 0x%llx\n", g_C);
-        OutputDebugStringA(buf);
+    uintptr_t rip = ep->ContextRecord->Rip;
+
+    // Hit at function entry
+    if (rip == g_HookAddr && !g_WaitingForReturn) {
+        // Read args: RCX = comp_array_ptr, RDX = out_result, R8 = index
+        uint64_t* comp_array_ptr = (uint64_t*)ep->ContextRecord->Rcx;
+        int index = (int)ep->ContextRecord->R8;
+
+        uint64_t comp_arr = *comp_array_ptr;
+        g_PendingEncrypted = *(uint64_t*)(comp_arr + index * 8);
+
+        // Set breakpoint on return address to capture result
+        g_ReturnAddr = *(uintptr_t*)ep->ContextRecord->Rsp;
+        ep->ContextRecord->Dr1 = g_ReturnAddr;
+        ep->ContextRecord->Dr7 |= (1 << 2);  // Enable DR1
+
+        g_WaitingForReturn = true;
+        ep->ContextRecord->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    return result;
+    // Hit at return - capture decrypted value
+    if (rip == g_ReturnAddr && g_WaitingForReturn) {
+        // RAX contains the out_result pointer, dereference to get decrypted
+        uint64_t* out_result = (uint64_t*)ep->ContextRecord->Rax;
+        uint64_t decrypted = *out_result;
+
+        if (g_C == 0 && g_PendingEncrypted != 0 && decrypted != 0) {
+            g_C = CalcC(g_PendingEncrypted, decrypted, g_Base);
+
+            char buf[128];
+            sprintf(buf, "[+] Captured C = 0x%llx\n", g_C);
+            OutputDebugStringA(buf);
+        }
+
+        // Disable return breakpoint
+        ep->ContextRecord->Dr7 &= ~(1 << 2);
+        g_WaitingForReturn = false;
+        ep->ContextRecord->Dr6 = 0;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
 }
 
-void InstallHook() {
-    g_Base = (uint64_t)GetModuleHandleA("Overwatch.exe");
-    void* target = (void*)(g_Base + 0x1AC0B30);
+void SetHwBreakpointAllThreads(uintptr_t addr) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    THREADENTRY32 te = { sizeof(te) };
+    DWORD pid = GetCurrentProcessId();
 
-    MH_Initialize();
-    MH_CreateHook(target, HookedReadComp, (void**)&g_OrigReadComp);
-    MH_EnableHook(target);
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid) {
+                HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                if (hThread) {
+                    SuspendThread(hThread);
+
+                    CONTEXT ctx = { 0 };
+                    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    GetThreadContext(hThread, &ctx);
+
+                    ctx.Dr0 = addr;
+                    ctx.Dr7 = (ctx.Dr7 & 0xFFFF0000) |
+                              (1 << 0) |    // DR0 local enable
+                              (0 << 16) |   // DR0 execute (00)
+                              (0 << 18);    // DR0 1-byte
+
+                    SetThreadContext(hThread, &ctx);
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+                }
+            }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+}
+
+void InstallHwbpHook() {
+    g_Base = (uintptr_t)GetModuleHandleA("Overwatch.exe");
+    g_HookAddr = g_Base + 0x1AC0B30;
+
+    AddVectoredExceptionHandler(1, HwbpHandler);
+    SetHwBreakpointAllThreads(g_HookAddr);
+
+    OutputDebugStringA("[+] HWBP hook installed on ow_component_read_by_index\n");
+}
+
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hinstDLL);
+        InstallHwbpHook();
+    }
+    return TRUE;
 }
 ```
+
+### Why Hardware Breakpoints Work
+
+| | Inline Hook | Hardware Breakpoint |
+|---|---|---|
+| Code modified | ✅ Yes | ❌ No |
+| Trampoline needed | ✅ Yes | ❌ No |
+| RSP issues | ✅ Crashes | ❌ None |
+| Detectable | Easily | Harder |
+| How it works | JMP patch | CPU DR0-DR3 registers |
+
+### Alternative: Inline Hook with Naked Stub (Advanced)
+
+If you MUST use inline hook, use a naked stub that preserves RSP:
+
+```cpp
+// hook_stub.asm - MASM
+.code
+
+extern g_OriginalBytes:qword
+extern g_OriginalFunc:qword
+extern HookCallback:proc
+
+HookStub PROC
+    ; We enter with original RSP (no call pushed ret addr yet)
+    ; Save volatile registers
+    push rax
+    push rcx
+    push rdx
+    push r8
+    push r9
+    push r10
+    push r11
+    sub rsp, 28h  ; Shadow space + alignment
+
+    ; Call our C++ callback
+    ; RCX, RDX, R8 are on stack, restore for callback
+    mov rcx, [rsp+28h+48h]   ; original RCX
+    mov rdx, [rsp+28h+40h]   ; original RDX
+    mov r8,  [rsp+28h+38h]   ; original R8
+    call HookCallback
+
+    add rsp, 28h
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdx
+    pop rcx
+    pop rax
+
+    ; Execute original 5 bytes at CURRENT RSP
+    ; This is the tricky part - must match original RSP
+    jmp g_OriginalFunc  ; JMP not CALL!
+HookStub ENDP
+
+end
+```
+
+This is complex and error-prone. **Use hardware breakpoints instead.**
 
 ### Function Details
 
