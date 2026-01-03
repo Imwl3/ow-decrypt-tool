@@ -890,6 +890,124 @@ x/8gx 0x253de502340
 
 ---
 
+---
+
+## Alternative: Get C via DLL Hook (No GDB)
+
+If you can't use GDB, hook `ow_component_read_by_index` instead of the VMP thunk.
+This is **regular Overwatch code** - safe to hook, VMP won't detect it.
+
+### Why This Works
+
+```
+ow_component_read_by_index @ base+0x1AC0B30  ← HOOK THIS (normal code)
+    │
+    ├─► Reads encrypted from entity+0x80[index]
+    ├─► Calls VMP thunk internally (untouched)
+    └─► Returns decrypted pointer in RAX
+```
+
+You capture encrypted (before) and decrypted (after), then reverse-calculate C.
+
+### CalcC Formula (VERIFIED ✓)
+
+Tested with 5 known encrypted/decrypted pairs - all produce correct C.
+
+```cpp
+inline uint64_t ror64(uint64_t v, int n) { return (v >> n) | (v << (64-n)); }
+inline uint64_t rol64(uint64_t v, int n) { return (v << n) | (v >> (64-n)); }
+
+uint64_t CalcC(uint64_t encrypted, uint64_t decrypted, uint64_t base) {
+    // Read context XOR from memory
+    uint64_t ctx_ptr = *(uint64_t*)(base + 0x3947AF8);
+    uint64_t ctx_xor = *(uint64_t*)(ctx_ptr + 0x17F);
+
+    // Reverse post-thunk: undo XOR and SUB to get thunk_output
+    uint64_t thunk_out = (decrypted ^ ctx_xor) - 0x246F476B55B569AAULL;
+
+    // Forward pre-thunk: apply transforms to get thunk_input
+    uint64_t t = encrypted;
+    t = ror64(t, 3);
+    t = rol64(t, 23);
+    t += 0x77D1EEE9B57BB5D7ULL;
+    t ^= 0x92;  // xor_key
+    t = rol64(t, 28);
+    t += 0x5C2713451FEB52FAULL;
+    t ^= 0x1F4723AC9E4C34DDULL;
+    t ^= 0xD4AAE416F53FAE18ULL;
+    uint64_t thunk_in = t;
+
+    // C = thunk_input XOR thunk_output
+    return thunk_in ^ thunk_out;
+}
+```
+
+### Complete Hook Implementation
+
+```cpp
+#include <MinHook.h>  // or Detours
+#include <cstdint>
+
+uint64_t g_C = 0;
+uint64_t g_Base = 0;
+
+typedef void* (__fastcall* ReadCompFn)(void* entity, void* rdx, int index);
+ReadCompFn g_OrigReadComp = nullptr;
+
+void* __fastcall HookedReadComp(void* entity, void* rdx, int index) {
+    // Capture encrypted value BEFORE call
+    uint64_t comp_arr = *(uint64_t*)((char*)entity + 0x80);
+    uint64_t encrypted = *(uint64_t*)(comp_arr + index * 8);
+
+    // Call original function (it will decrypt internally)
+    void* decrypted = g_OrigReadComp(entity, rdx, index);
+
+    // Calculate C from first valid pair
+    if (g_C == 0 && encrypted != 0 && decrypted != nullptr) {
+        g_C = CalcC(encrypted, (uint64_t)decrypted, g_Base);
+
+        // Optional: verify by decrypting another value
+        char buf[128];
+        sprintf(buf, "[+] Captured C = 0x%llx\n", g_C);
+        OutputDebugStringA(buf);
+    }
+
+    return decrypted;
+}
+
+void InstallHook() {
+    g_Base = (uint64_t)GetModuleHandleA("Overwatch.exe");
+    void* target = (void*)(g_Base + 0x1AC0B30);
+
+    MH_Initialize();
+    MH_CreateHook(target, HookedReadComp, (void**)&g_OrigReadComp);
+    MH_EnableHook(target);
+}
+```
+
+### Function Details
+
+| Property | Value |
+|----------|-------|
+| Address | `base + 0x1AC0B30` |
+| Prologue | `48 89 5c 24 10` (5 bytes, hookable) |
+| Calling convention | __fastcall (RCX=entity, RDX=unused, R8=index) |
+| Return | Decrypted pointer in RAX |
+
+### Test Results
+
+```
+enc=0x0e2e9898fd0bdf50 dec=0x253de502340 → C=0x14cecdeea26a8100 ✓
+enc=0x0e2e9907a18bdf50 dec=0x253df838fc0 → C=0x14cecdeea26a8100 ✓
+enc=0x0e2e9d34186bdf50 dec=0x253e3a706a0 → C=0x14cecdeea26a8100 ✓
+enc=0x0e2eaca777dbdf50 dec=0x253f251a630 → C=0x14cecdeea26a8100 ✓
+enc=0x0e2f790e00cbdf50 dec=0x2537fb92e80 → C=0x14cecdeea26a8100 ✓
+```
+
+All 5 test cases produce the same C - formula is verified!
+
+---
+
 ### Why GDB Can't Call Thunk
 
 - GDB interrupts in kernel context (0xfffff807...)
