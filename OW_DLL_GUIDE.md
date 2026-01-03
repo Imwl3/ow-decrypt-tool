@@ -909,6 +909,14 @@ ow_component_read_by_index @ base+0x1AC0B30  ← HOOK THIS (normal code)
 
 You capture encrypted (before) and decrypted (after), then reverse-calculate C.
 
+**⚠️ IMPORTANT: Function Signature**
+```
+RCX = comp_array_ptr   ; Pointer TO component array pointer (caller passes entity+0x80)
+RDX = out_result       ; OUTPUT pointer - decrypted value written here (NOT unused!)
+R8  = index            ; Component array index
+Returns RDX in RAX
+```
+
 ### CalcC Formula (VERIFIED ✓)
 
 Tested with 5 known encrypted/decrypted pairs - all produce correct C.
@@ -951,28 +959,37 @@ uint64_t CalcC(uint64_t encrypted, uint64_t decrypted, uint64_t base) {
 uint64_t g_C = 0;
 uint64_t g_Base = 0;
 
-typedef void* (__fastcall* ReadCompFn)(void* entity, void* rdx, int index);
+// CORRECT signature:
+// - RCX = pointer to component array pointer (entity+0x80 is passed by caller)
+// - RDX = OUTPUT pointer where decrypted value is written
+// - R8  = index into component array
+// - Returns RDX (the output pointer)
+typedef void* (__fastcall* ReadCompFn)(uint64_t* comp_array_ptr, uint64_t* out_result, int index);
 ReadCompFn g_OrigReadComp = nullptr;
 
-void* __fastcall HookedReadComp(void* entity, void* rdx, int index) {
-    // Capture encrypted value BEFORE call
-    uint64_t comp_arr = *(uint64_t*)((char*)entity + 0x80);
+void* __fastcall HookedReadComp(uint64_t* comp_array_ptr, uint64_t* out_result, int index) {
+    // RCX points to the component_array pointer - dereference to get array
+    // (caller passes entity+0x80, function does *RCX to get actual array)
+    uint64_t comp_arr = *comp_array_ptr;
     uint64_t encrypted = *(uint64_t*)(comp_arr + index * 8);
 
-    // Call original function (it will decrypt internally)
-    void* decrypted = g_OrigReadComp(entity, rdx, index);
+    // Call original function - MUST pass out_result through!
+    // The function writes decrypted pointer to *out_result
+    void* result = g_OrigReadComp(comp_array_ptr, out_result, index);
+
+    // After the call, *out_result contains the decrypted pointer
+    uint64_t decrypted = *out_result;
 
     // Calculate C from first valid pair
-    if (g_C == 0 && encrypted != 0 && decrypted != nullptr) {
-        g_C = CalcC(encrypted, (uint64_t)decrypted, g_Base);
+    if (g_C == 0 && encrypted != 0 && decrypted != 0) {
+        g_C = CalcC(encrypted, decrypted, g_Base);
 
-        // Optional: verify by decrypting another value
         char buf[128];
         sprintf(buf, "[+] Captured C = 0x%llx\n", g_C);
         OutputDebugStringA(buf);
     }
 
-    return decrypted;
+    return result;
 }
 
 void InstallHook() {
@@ -991,8 +1008,20 @@ void InstallHook() {
 |----------|-------|
 | Address | `base + 0x1AC0B30` |
 | Prologue | `48 89 5c 24 10` (5 bytes, hookable) |
-| Calling convention | __fastcall (RCX=entity, RDX=unused, R8=index) |
-| Return | Decrypted pointer in RAX |
+| Calling convention | __fastcall (see below) |
+| Return | Output pointer (RDX) in RAX |
+
+**Correct Parameter Layout:**
+```
+RCX = comp_array_ptr   ; Pointer TO the component array pointer (entity+0x80)
+                       ; Function does: comp_array = *RCX
+RDX = out_result       ; OUTPUT pointer - decrypted value written to *RDX
+R8  = index            ; Component array index
+RAX = returns RDX      ; Returns the output pointer itself
+```
+
+**IMPORTANT:** The caller passes `entity+0x80` in RCX, NOT the entity pointer!
+The function dereferences RCX to get the actual component array.
 
 ### Test Results
 
