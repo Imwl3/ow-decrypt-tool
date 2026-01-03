@@ -4,8 +4,10 @@
 
 This guide explains how to build a DLL that reads Overwatch entities from inside the game process.
 
-**Critical Discovery (VERIFIED):** The VMP thunk IS a simple XOR! C is session-stable.
-- **C = `input XOR output`** - same for ALL calls within a session
+**Critical Discovery (VERIFIED):** The VMP thunk IS a simple XOR! C is stable per-call-site.
+- **C = `input XOR output`** - same for all calls from the SAME code path
+- Different code paths (callers) have DIFFERENT C values!
+- For component decryption: break at `base+0x1AC0BA0` (CALL inside ow_component_read_by_index)
 - Get C once via GDB breakpoint, then use pure math to decrypt
 - No need to call the actual thunk from DLL!
 
@@ -203,8 +205,10 @@ Component arrays contain ENCRYPTED pointers:
 
 ### ~~Why Simple XOR Doesn't Work~~ → IT DOES WORK!
 
-**CORRECTION:** We originally thought C varied per-call, but testing proved otherwise:
-- C IS session-stable (same for ALL calls within a session)
+**CORRECTION:** We originally thought C was globally session-stable, but testing proved otherwise:
+- C is stable per-call-site (same for all calls from the SAME code path)
+- Different callers to the VMP thunk have DIFFERENT C values!
+- For component decryption: all calls go through `ow_component_read_by_index` → same C
 - The VMP thunk IS a simple XOR: `output = input XOR C`
 - You do NOT need to call the thunk - pure math works!
 
@@ -250,7 +254,7 @@ ENCRYPTED COMPONENT POINTER
           ▼
 ┌─────────────────────────────┐
 │ Step 7: XOR with C          │  temp ^= C
-│ *** SIMPLE XOR! ***         │  C = session-stable constant
+│ *** SIMPLE XOR! ***         │  C = stable per-call-site
 └─────────────────────────────┘
           │
           ▼
@@ -318,7 +322,7 @@ uintptr_t DecryptComponentPtr(uint64_t encrypted) {
     // Steps 1-6: Pre-thunk transform
     uint64_t thunk_input = PreThunkTransform(encrypted);
 
-    // Step 7: Simple XOR with C (session-stable constant!)
+    // Step 7: Simple XOR with C (stable per-call-site!)
     uint64_t thunk_output = thunk_input ^ g_C;
 
     // Steps 8-9: Post-thunk transform
@@ -529,11 +533,12 @@ void* ptr = DecryptComponentPtr(enc);  // Uses real encrypted value
 #define CONST_XOR2        0xD4AAE416F53FAE18ULL
 #define CONST_ADD2        0x246F476B55B569AAULL
 
-// ===== CURRENT SESSION (PID 13540) =====
-// Base:         0x7ff7e83b0000
-// C (thunk XOR): 0x14cecdeea26a8100  *** SESSION-STABLE! ***
+// ===== CURRENT SESSION (PID 3204) =====
+// Base:         0x7ff730830000
+// C (thunk XOR): 0xc20dee6e4bc035fe  *** STABLE PER-CALL-SITE! ***
 // context[0x17F]: 0x2e5d1c5a009dfd9b  (at OFFSET 0x17F, not index!)
 // xor_key:      0x92
+// CR3:          0x3f9620000
 ```
 
 ---
@@ -683,22 +688,33 @@ uint64_t decrypt_component_ptr(uint64_t encrypted) {
 
 ### How to Get C (One-Time per Session)
 
+**⚠️ CRITICAL:** C is per-call-site, NOT global! Break on the CALL inside
+`ow_component_read_by_index`, NOT on the thunk entry directly.
+
 ```bash
-sudo timeout 20 gdb -q -batch \
+OW_BASE=0x7ff730830000
+CR3=0xYOUR_CR3
+THUNK_CALL=$((OW_BASE + 0x1AC0BA0))  # CALL instruction inside decrypt func
+
+sudo timeout 25 gdb -q -batch \
   -ex "set architecture i386:x86-64" \
   -ex "target remote localhost:1234" \
-  -ex "set \$cr3 = CR3_VALUE" \
-  -ex "hbreak *THUNK_CALL_ADDR" \
+  -ex "set \$cr3 = $CR3" \
+  -ex "hbreak *$THUNK_CALL" \
   -ex "continue" \
-  -ex "printf \"Input: 0x%llx\\n\", \$rcx" \
+  -ex "set \$in = \$rcx" \
   -ex "stepi" \
   -ex "finish" \
-  -ex "printf \"Output: 0x%llx\\n\", \$rax" \
+  -ex "printf \"C = 0x%llx\\n\", \$in ^ \$rax" \
   -ex "delete" \
   -ex "detach"
-
-# C = Input XOR Output
 ```
+
+**Why this matters:**
+- Thunk @ `base+0x523290` is called by MULTIPLE code paths
+- Each caller has a DIFFERENT C value!
+- Breaking at thunk entry captures random caller's C (wrong!)
+- Must break at `base+0x1AC0BA0` (the CALL inside component decrypt function)
 
 ### Tested Results
 
@@ -824,7 +840,7 @@ sudo timeout 20 gdb -q -batch \
   -ex "delete" -ex "detach"
 ```
 
-**Results:**
+**Results (when breaking at same call-site):**
 ```
 Call 1: input=0x1d231b702b3e0cc1, output=0x09edd69e89548dc1
         C = 0x14cecdeea26a8100
@@ -832,8 +848,12 @@ Call 1: input=0x1d231b702b3e0cc1, output=0x09edd69e89548dc1
 Call 2: input=0x1d231b702e00ea71, output=0x09edd69e8c6a6b71
         C = 0x14cecdeea26a8100
 
-C IS IDENTICAL! Session-stable confirmed.
+C IS IDENTICAL for same call-site! Per-call-site stability confirmed.
 ```
+
+**⚠️ However:** Different code paths calling the thunk have DIFFERENT C values!
+Breaking directly at the thunk (`base+0x523290`) captures random callers → unstable C.
+Must break at the specific CALL site inside `ow_component_read_by_index`.
 
 ---
 
